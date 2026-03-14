@@ -12,6 +12,7 @@ import { getFeishuRuntime } from "./runtime.js";
 import { createFeishuClient } from "./client.js";
 import { resolveFeishuAccount } from "./accounts.js";
 import { tryRecordMessage } from "./dedup.js";
+import { ExpiringLruCache } from "./cache.js";
 import {
   resolveFeishuGroupConfig,
   resolveFeishuReplyPolicy,
@@ -31,64 +32,12 @@ import { maybeCreateDynamicAgent } from "./dynamic-agent.js";
 import { runWithFeishuToolContext } from "./tools-common/tool-context.js";
 import type { DynamicAgentCreationConfig } from "./types.js";
 
-// --- Permission error extraction ---
-// Extract permission grant URL from Feishu API error response.
-type PermissionError = {
-  code: number;
-  message: string;
-  grantUrl?: string;
-};
-
-function decodeHtmlEntities(raw: string): string {
-  return raw
-    .replace(/&amp;/gi, "&")
-    .replace(/&#39;|&apos;/gi, "'")
-    .replace(/&quot;/gi, '"');
-}
-
-function extractFirstUrl(raw: string): string | undefined {
-  if (!raw) return undefined;
-  const decoded = decodeHtmlEntities(raw);
-  const urlMatch = decoded.match(/https?:\/\/[^\s"'<>]+/i);
-  return urlMatch?.[0];
-}
-
-
-function extractPermissionError(err: unknown): PermissionError | null {
-  if (!err || typeof err !== "object") return null;
-
-  // Axios error structure: err.response.data contains the Feishu error
-  const axiosErr = err as { response?: { data?: unknown } };
-  const data = axiosErr.response?.data;
-  if (!data || typeof data !== "object") return null;
-
-  const feishuErr = data as {
-    code?: number;
-    msg?: string;
-    error?: { permission_violations?: Array<{ uri?: string }> };
-  };
-
-  // Feishu permission error code: 99991672
-  if (feishuErr.code !== 99991672) return null;
-
-  const msg = feishuErr.msg ?? "";
-  const grantUrlFromMsg = extractFirstUrl(msg);
-  const grantUrlFromViolations = feishuErr.error?.permission_violations
-    ?.map((item) => extractFirstUrl(item.uri ?? ""))
-    .find((url): url is string => Boolean(url));
-  const grantUrl = grantUrlFromMsg ?? grantUrlFromViolations;
-
-  return {
-    code: feishuErr.code,
-    message: msg,
-    grantUrl,
-  };
-}
+import { type PermissionError, extractPermissionError } from "./api-error-parser.js";
 
 // --- Sender name resolution (so the agent can distinguish who is speaking in group chats) ---
 // Cache display names by open_id to avoid an API call on every message.
 const SENDER_NAME_TTL_MS = 10 * 60 * 1000;
-const senderNameCache = new Map<string, { name: string; expireAt: number }>();
+const senderNameCache = new ExpiringLruCache<string, string>(5000);
 
 // Cache permission errors to avoid spamming the user with repeated notifications.
 // Key: appId or "default", Value: timestamp of last notification
@@ -241,9 +190,8 @@ async function resolveFeishuSenderName(params: {
   if (!account.configured) return {};
   if (!senderOpenId) return {};
 
-  const cached = senderNameCache.get(senderOpenId);
-  const now = Date.now();
-  if (cached && cached.expireAt > now) return { name: cached.name };
+  const cachedName = senderNameCache.get(senderOpenId);
+  if (cachedName) return { name: cachedName };
 
   try {
     const client = createFeishuClient(account);
@@ -259,7 +207,7 @@ async function resolveFeishuSenderName(params: {
       res?.data?.user?.nickname;
 
     if (name && typeof name === "string") {
-      senderNameCache.set(senderOpenId, { name, expireAt: now + SENDER_NAME_TTL_MS });
+      senderNameCache.set(senderOpenId, name, SENDER_NAME_TTL_MS);
       return { name };
     }
 
@@ -280,7 +228,7 @@ async function resolveFeishuSenderName(params: {
 
 // Cache group bot counts for command mention bypass policy checks.
 const GROUP_BOT_COUNT_TTL_MS = 10 * 60 * 1000;
-const groupBotCountCache = new Map<string, { count: number; expireAt: number }>();
+const groupBotCountCache = new ExpiringLruCache<string, number>(2000);
 // Fallback flush only for standalone forwarded messages.
 // Quote-reply merging should rely on parent_id relation instead of time windows.
 const FORWARDED_COALESCE_WINDOW_MS = 1500;
@@ -293,7 +241,7 @@ type PendingForwardedDispatchEntry = {
 };
 const pendingForwardedDispatch = new Map<string, PendingForwardedDispatchEntry>();
 const pendingForwardedDispatchByMessageId = new Map<string, string>();
-const recentForwardedCompanionReplies = new Map<string, number>();
+const recentForwardedCompanionReplies = new ExpiringLruCache<string, boolean>(1000);
 
 function getForwardedKey(params: {
   accountId: string;
@@ -316,13 +264,10 @@ function markForwardedCompanionReply(params: {
   chatId: string;
   forwardedMessageId: string;
 }): void {
-  const now = Date.now();
-  for (const [key, expireAt] of recentForwardedCompanionReplies) {
-    if (expireAt <= now) recentForwardedCompanionReplies.delete(key);
-  }
   recentForwardedCompanionReplies.set(
     getForwardedKey(params),
-    now + FORWARDED_COMPANION_TTL_MS,
+    true,
+    FORWARDED_COMPANION_TTL_MS,
   );
 }
 
@@ -332,15 +277,11 @@ function consumeForwardedCompanionReply(params: {
   forwardedMessageId: string;
 }): boolean {
   const key = getForwardedKey(params);
-  const now = Date.now();
-  const expireAt = recentForwardedCompanionReplies.get(key);
-  if (!expireAt) return false;
-  if (expireAt <= now) {
+  if (recentForwardedCompanionReplies.get(key)) {
     recentForwardedCompanionReplies.delete(key);
-    return false;
+    return true;
   }
-  recentForwardedCompanionReplies.delete(key);
-  return true;
+  return false;
 }
 
 async function resolveFeishuGroupBotCount(params: {
@@ -352,9 +293,8 @@ async function resolveFeishuGroupBotCount(params: {
   if (!account.configured || !chatId) return undefined;
 
   const cacheKey = `${account.accountId}:${chatId}`;
-  const now = Date.now();
-  const cached = groupBotCountCache.get(cacheKey);
-  if (cached && cached.expireAt > now) return cached.count;
+  const cachedCount = groupBotCountCache.get(cacheKey);
+  if (cachedCount !== undefined) return cachedCount;
 
   try {
     const client = createFeishuClient(account);
@@ -363,7 +303,7 @@ async function resolveFeishuGroupBotCount(params: {
     });
     const parsed = Number.parseInt(String(res?.data?.bot_count ?? ""), 10);
     if (Number.isFinite(parsed) && parsed >= 0) {
-      groupBotCountCache.set(cacheKey, { count: parsed, expireAt: now + GROUP_BOT_COUNT_TTL_MS });
+      groupBotCountCache.set(cacheKey, parsed, GROUP_BOT_COUNT_TTL_MS);
       return parsed;
     }
     return undefined;

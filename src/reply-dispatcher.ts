@@ -122,13 +122,29 @@ export function createFeishuReplyDispatcher(params: CreateFeishuReplyDispatcherP
   let streamingCompleted = false;
   let partialUpdateQueue: Promise<void> = Promise.resolve();
   let streamingStartPromise: Promise<void> | null = null;
+  let lastUpdateMs = 0;
+  let updatePending = false;
 
   const mergeIntoStreamText = (nextText: string) => {
     streamText = mergeStreamingText(streamText, nextText);
   };
 
   const enqueueStreamingFlush = () => {
+    if (updatePending) return;
+    updatePending = true;
+
     partialUpdateQueue = partialUpdateQueue.then(async () => {
+      const now = Date.now();
+      const elapsed = now - lastUpdateMs;
+      const THROTTLE_MS = 200; // Throttle to max 5 updates per second
+      
+      if (elapsed < THROTTLE_MS) {
+        await new Promise((resolve) => setTimeout(resolve, THROTTLE_MS - elapsed));
+      }
+
+      updatePending = false;
+      lastUpdateMs = Date.now();
+
       if (streamingStartPromise) {
         await streamingStartPromise;
       }

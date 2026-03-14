@@ -7,6 +7,7 @@ import { normalizeFeishuMarkdownLinks } from "./text/markdown-links.js";
 import { resolveReceiveIdType, normalizeFeishuTarget } from "./targets.js";
 import { getFeishuRuntime } from "./runtime.js";
 import { listFeishuAccountIds, resolveFeishuAccount } from "./accounts.js";
+import { ExpiringLruCache } from "./cache.js";
 
 export type FeishuMessageInfo = {
   messageId: string;
@@ -19,9 +20,9 @@ export type FeishuMessageInfo = {
 };
 
 const MERGE_FORWARD_NAME_CACHE_TTL_MS = 10 * 60 * 1000;
-const mergeForwardSenderNameCache = new Map<string, { name: string; expireAt: number }>();
-const mergeForwardBotNameCache = new Map<string, { name: string; expireAt: number }>();
-const mergeForwardAppNameCache = new Map<string, { name: string; expireAt: number }>();
+const mergeForwardSenderNameCache = new ExpiringLruCache<string, string>(5000);
+const mergeForwardBotNameCache = new ExpiringLruCache<string, string>(5000);
+const mergeForwardAppNameCache = new ExpiringLruCache<string, string>(5000);
 
 type MergeForwardMention = {
   key?: string;
@@ -66,10 +67,9 @@ async function resolveCurrentBotName(params: {
   appId: string;
 }): Promise<string | undefined> {
   const cacheKey = `bot:${params.appId}`;
-  const now = Date.now();
-  const cached = mergeForwardBotNameCache.get(cacheKey);
-  if (cached && cached.expireAt > now) {
-    return cached.name;
+  const cachedName = mergeForwardBotNameCache.get(cacheKey);
+  if (cachedName) {
+    return cachedName;
   }
 
   if (typeof params.client?.request !== "function") return undefined;
@@ -83,10 +83,7 @@ async function resolveCurrentBotName(params: {
     const botName = response?.data?.bot?.app_name;
     if (typeof botName === "string" && botName.trim()) {
       const normalized = botName.trim();
-      mergeForwardBotNameCache.set(cacheKey, {
-        name: normalized,
-        expireAt: now + MERGE_FORWARD_NAME_CACHE_TTL_MS,
-      });
+      mergeForwardBotNameCache.set(cacheKey, normalized, MERGE_FORWARD_NAME_CACHE_TTL_MS);
       return normalized;
     }
     return undefined;
@@ -104,10 +101,9 @@ async function resolveAppNameById(params: {
   if (!appId) return undefined;
 
   const cacheKey = `${params.accountId}:${appId}`;
-  const now = Date.now();
-  const cached = mergeForwardAppNameCache.get(cacheKey);
-  if (cached && cached.expireAt > now) {
-    return cached.name;
+  const cachedName = mergeForwardAppNameCache.get(cacheKey);
+  if (cachedName) {
+    return cachedName;
   }
 
   if (typeof params.client?.request !== "function") return undefined;
@@ -123,10 +119,7 @@ async function resolveAppNameById(params: {
     const appName = response?.data?.app?.app_name;
     if (typeof appName === "string" && appName.trim()) {
       const normalized = appName.trim();
-      mergeForwardAppNameCache.set(cacheKey, {
-        name: normalized,
-        expireAt: now + MERGE_FORWARD_NAME_CACHE_TTL_MS,
-      });
+      mergeForwardAppNameCache.set(cacheKey, normalized, MERGE_FORWARD_NAME_CACHE_TTL_MS);
       return normalized;
     }
     return undefined;
@@ -300,10 +293,9 @@ function buildMergeForwardSenderLabel(params: {
   }
 
   const cacheKey = `${params.accountId}:${lookupType}:${senderId}`;
-  const now = Date.now();
-  const cached = mergeForwardSenderNameCache.get(cacheKey);
-  if (cached && cached.expireAt > now) {
-    return Promise.resolve(cached.name);
+  const cachedName = mergeForwardSenderNameCache.get(cacheKey);
+  if (cachedName) {
+    return Promise.resolve(cachedName);
   }
 
   return contactGet({
@@ -316,10 +308,7 @@ function buildMergeForwardSenderLabel(params: {
         res?.data?.user?.nickname;
       const finalName =
         typeof resolvedName === "string" && resolvedName.trim() ? resolvedName.trim() : localFallback;
-      mergeForwardSenderNameCache.set(cacheKey, {
-        name: finalName,
-        expireAt: now + MERGE_FORWARD_NAME_CACHE_TTL_MS,
-      });
+      mergeForwardSenderNameCache.set(cacheKey, finalName, MERGE_FORWARD_NAME_CACHE_TTL_MS);
       return finalName;
     })
     .catch(() => localFallback);
